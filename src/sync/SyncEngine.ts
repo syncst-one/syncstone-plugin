@@ -37,6 +37,9 @@ const MAX_SILENT_LOCAL_DELETES = 5;
 /** What to do with files that were deleted here while Syncstone was not running (see `doFullSync`). */
 type MissingMode = "delete" | "restore" | "hold";
 
+/** The note changed here while the sync was about to write into it (typing): the write is dropped and compared again. */
+class LocalChangedMeanwhile extends Error {}
+
 /** Errors that say "nothing will work right now" (offline, signed out, server down) - those still stop the whole run. */
 function isFatal(err: unknown): boolean {
   if (!(err instanceof SyncstoneApiError)) return false;
@@ -187,6 +190,12 @@ export class SyncEngine {
   private readonly pendingRenames = new Map<string, string>();
   /** The answer about files deleted while Syncstone was not running: used by the next full sync, then forgotten. */
   private missingAnswer: "delete" | "restore" | "asking" | "dismissed" | null = null;
+  /**
+   * What this device sent per file and has not seen confirmed yet. On a poor connection an upload can reach the server
+   * while its answer is lost; the server's next list then shows this device's own text, which must not be taken for
+   * another device's edit (that would merge it with the newer typing here and could write over it).
+   */
+  private readonly sentNotConfirmed = new Map<string, Array<{ hash: string; bytes: Uint8Array }>>();
   /** Files whose write was refused as outdated and are being merged right now (guards against going round in circles). */
   private readonly resolvingStale = new Set<string>();
 
@@ -1360,6 +1369,17 @@ export class SyncEngine {
    * and the other one is then saved as a conflict copy next to the note instead of being thrown away.
    */
   private async reconcileExisting(item: DecodedFileListItem, path: string, localFile: TFile, rechecked = false): Promise<void> {
+    try {
+      await this.reconcileExistingOnce(item, path, localFile);
+    } catch (err) {
+      if (!(err instanceof LocalChangedMeanwhile)) throw err;
+      // Typed into while this was being settled: compared once more with what is there now; after that the edit goes
+      // out as a normal change of this device.
+      if (!rechecked) await this.reconcileExisting(item, path, this.deps.fs.getFileByPath(path) ?? localFile, true);
+    }
+  }
+
+  private async reconcileExistingOnce(item: DecodedFileListItem, path: string, localFile: TFile): Promise<void> {
     const localBytes = await this.readLocal(localFile);
     if (!localBytes) return; // deleted while the sync was busy: the delete event takes care of it
     const localHash = await this.deps.crypto.hashContent(localBytes);
@@ -1383,7 +1403,22 @@ export class SyncEngine {
     // What both sides looked like at the last sync tells who actually changed something. Timestamps alone are wrong
     // here: a rename on another device bumps the server's `updatedAt` without touching the content and would make
     // that side "newer" than a local edit that was not uploaded yet, and the clocks of the devices are not in step.
-    const lastHash = (await this.deps.localIndex.get(item.id))?.lastContentHashBlinded;
+    const known = await this.deps.localIndex.get(item.id);
+    let lastHash = known?.lastContentHashBlinded;
+    const own = this.sentNotConfirmed.get(item.id)?.find((sent) => sent.hash === remoteHashBase64);
+    if (own && lastHash !== remoteHashBase64) {
+      // The server has this device's own text (sent, answer lost): that is what both have in common now.
+      await this.deps.localIndex.put({
+        fileId: item.id,
+        localPath: path,
+        lastKnownVersion: item.version,
+        lastContentHashBlinded: remoteHashBase64,
+        lastSyncedAt: new Date().toISOString(),
+      });
+      await this.rememberBase(item.id, path, own.bytes, remoteHashBase64);
+      this.sentNotConfirmed.delete(item.id);
+      lastHash = remoteHashBase64;
+    }
     let remoteWins: boolean;
     if (lastHash === remoteHashBase64) remoteWins = false; // the server content is the one we last synced: only the local side changed
     else if (lastHash === localHashBase64) remoteWins = true; // the local file is the one we last synced: only the remote side changed
@@ -1404,21 +1439,13 @@ export class SyncEngine {
 
     if (remoteWins) {
       if (live) return; // the live session already carries this content
-      // The note may be open with typing that is not saved yet: saved first, and if that changed it, compared again
-      // (merged or kept as a copy) instead of overwritten.
-      if (!rechecked && (await this.deps.saveOpenEditor?.(path))) {
-        const now = await this.readLocal(localFile);
-        if (now && toBase64(await this.deps.crypto.hashContent(now)) !== localHashBase64) {
-          await this.reconcileExisting(item, path, localFile, true);
-          return;
-        }
-      }
       // Both sides changed and this device's version loses: it must not just vanish. (A losing server version stays in
       // the version history; a losing local one exists nowhere else.) Notes that could be merged were handled above;
       // this covers everything else - images, PDFs, notes too large or not readable as text.
       const willDownload = !(Platform.isMobile && item.contentSize > this.mobileLimit());
       if (bothChanged && !copied && willDownload) await this.saveConflictCopy(path, localBytes);
-      await this.downloadFile(item, path, bothChanged ? "newer" : "remote");
+      // Written only if nothing was typed here meanwhile (checked right before writing, see `downloadFile`).
+      await this.downloadFile(item, path, bothChanged ? "newer" : "remote", localHashBase64);
     } else {
       // Both sides changed and the server's version loses: it is kept next to the note as a copy (for notes that could
       // not be merged this happened above already), so the other device's work does not just disappear from the vault.
@@ -1529,12 +1556,14 @@ export class SyncEngine {
       await this.saveConflictCopy(path, remoteWins ? localText : remoteText);
       return "copied";
     }
+    const localHashNow = toBase64(await this.deps.crypto.hashContent(localBytes));
     if (merged === remoteText) {
-      await this.downloadFile(item, path, "newer");
+      await this.downloadFile(item, path, "newer", localHashNow);
     } else if (merged === localText) {
       await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: await this.deps.crypto.hashContent(localBytes) }, "newer", toBase64(item.contentHashBlinded));
     } else {
       const bytes = textEncoder.encode(merged);
+      if (!(await this.unchangedSince(path, localHashNow))) throw new LocalChangedMeanwhile();
       await this.deps.fs.writeBinary(path, bytes);
       const file = this.deps.fs.getFileByPath(path) ?? localFile;
       await this.uploadFile(file, item.id, { plaintext: bytes, hash: await this.deps.crypto.hashContent(bytes) }, "newer", toBase64(item.contentHashBlinded));
@@ -1622,6 +1651,9 @@ export class SyncEngine {
       if (!plaintext) return; // deleted while it was being read
       uploadedPlaintext = plaintext;
       hash = precomputed?.hash ?? (await this.deps.crypto.hashContent(plaintext));
+      const attempts = this.sentNotConfirmed.get(fileId) ?? [];
+      attempts.push({ hash: toBase64(hash), bytes: plaintext });
+      this.sentNotConfirmed.set(fileId, attempts.slice(-3));
       const encryptedContent = await this.deps.crypto.encryptContent(plaintext);
       const encryptedPath = await this.deps.crypto.encryptPath(file.path);
 
@@ -1666,6 +1698,7 @@ export class SyncEngine {
       lastSyncedAt: new Date().toISOString(),
     };
     await this.deps.localIndex.put(record);
+    this.sentNotConfirmed.delete(fileId);
     this.noteOwnWrite(result.version);
     // Deleted here while it was on its way up (a small file is sent in one piece): the copy that just arrived at the server
     // goes again - the delete event found nothing to delete at the time and would otherwise never come back to it.
@@ -1720,7 +1753,20 @@ export class SyncEngine {
     return false;
   }
 
-  private async downloadFile(item: DecodedFileListItem, path: string, why?: LogReason): Promise<void> {
+  /**
+   * Right before the sync writes into `path`: an open editor is saved, and the file must still have `expectedHash` (what
+   * the decision to write was based on). False when something was typed meanwhile.
+   */
+  private async unchangedSince(path: string, expectedHash: string): Promise<boolean> {
+    await this.deps.saveOpenEditor?.(path);
+    const file = this.deps.fs.getFileByPath(path);
+    if (!file) return true;
+    const bytes = await this.readLocal(file);
+    return !bytes || toBase64(await this.deps.crypto.hashContent(bytes)) === expectedHash;
+  }
+
+  /** `expectLocalHash`: replaces the file here only if it still has this content (nothing typed meanwhile). */
+  private async downloadFile(item: DecodedFileListItem, path: string, why?: LogReason, expectLocalHash?: string): Promise<void> {
     if (isMarkerPath(path)) {
       // Folder marker: nothing to download, just make sure the (empty) folder exists here.
       await this.deps.fs.writeMarker(path);
@@ -1762,6 +1808,9 @@ export class SyncEngine {
       if (this.deletedSince(path, startedAt)) return;
       const { ciphertext, iv } = unpackBlob(blob);
       const plaintext = await this.deps.crypto.decryptContent(ciphertext, iv);
+      if (expectLocalHash !== undefined && this.deps.fs.getFileByPath(path) && !(await this.unchangedSince(path, expectLocalHash))) {
+        throw new LocalChangedMeanwhile();
+      }
       await this.deps.fs.writeBinary(path, plaintext);
       downloaded = plaintext;
     } catch (err) {
