@@ -1,6 +1,7 @@
 import { Modal, Notice, TFile, setIcon, type App } from "obsidian";
 import { currentLocale, t, type MessageKey } from "../i18n/index.js";
 import type { LogEntry, LogKind, SyncLog } from "../sync/SyncLog.js";
+import type { TransferTracker } from "./TransferTracker.js";
 
 const ICONS: Record<LogKind, string> = {
   up: "arrow-up",
@@ -28,6 +29,8 @@ const isProblem = (entry: LogEntry): boolean => PROBLEMS.has(entry.kind) || (ent
 /** The dialog behind "Sync log" in the sync menu: what was synced when, newest first. */
 export class SyncLogModal extends Modal {
   private listEl!: HTMLElement;
+  private nowEl!: HTMLElement;
+  private nowTimer: number | null = null;
   private offChange: (() => void) | null = null;
   private renderTimer: number | null = null;
   private onlyProblems = false;
@@ -35,6 +38,7 @@ export class SyncLogModal extends Modal {
   constructor(
     app: App,
     private readonly log: SyncLog,
+    private readonly transfers?: TransferTracker,
   ) {
     super(app);
   }
@@ -56,6 +60,9 @@ export class SyncLogModal extends Modal {
     const clear = bar.createEl("button", { text: t("p.log.clear") });
     clear.addEventListener("click", () => this.log.clear());
 
+    this.nowEl = this.contentEl.createDiv({ cls: "syncstone-log-now" });
+    this.renderNow();
+    this.nowTimer = window.setInterval(() => this.renderNow(), 1000);
     this.listEl = this.contentEl.createDiv({ cls: "syncstone-log-list" });
     this.offChange = this.log.onChange(() => this.scheduleRender());
     this.render();
@@ -65,6 +72,8 @@ export class SyncLogModal extends Modal {
     this.offChange?.();
     this.offChange = null;
     if (this.renderTimer !== null) window.clearTimeout(this.renderTimer);
+    if (this.nowTimer !== null) window.clearInterval(this.nowTimer);
+    this.nowTimer = null;
     this.contentEl.empty();
   }
 
@@ -75,6 +84,22 @@ export class SyncLogModal extends Modal {
       this.renderTimer = null;
       this.render();
     }, 500);
+  }
+
+  /** At the top: the files on their way right now (with how far they are) and how many wait. */
+  private renderNow(): void {
+    const now = this.transfers?.current();
+    this.nowEl.empty();
+    if (!now || (now.active.length === 0 && now.queued === 0)) {
+      this.nowEl.hide();
+      return;
+    }
+    this.nowEl.show();
+    for (const { path, loaded, total } of now.active) {
+      const text = total > 0 ? t("p.log.nowBytes", { path, done: formatSize(loaded), total: formatSize(total) }) : t("p.log.now", { path });
+      this.nowEl.createDiv({ cls: "syncstone-log-now-row", text });
+    }
+    if (now.queued > 0) this.nowEl.createDiv({ cls: "syncstone-log-now-row", text: t("p.log.waiting", { count: now.queued }) });
   }
 
   private render(): void {

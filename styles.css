@@ -742,3 +742,18 @@ button.syncstone-quiet-button:not(.mod-cta) {
   color: var(--text-normal);
   text-decoration: underline;
 }
+
+/* Sync log: what is on its way right now */
+.syncstone-log-now {
+  margin: 0 0 var(--size-4-2);
+  padding: var(--size-4-2) var(--size-4-3);
+  border-radius: var(--radius-m);
+  background: var(--background-secondary);
+  font-size: var(--font-ui-small);
+  color: var(--text-muted);
+}
+.syncstone-log-now-row {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

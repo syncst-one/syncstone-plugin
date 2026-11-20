@@ -236,7 +236,7 @@ export default class SyncstonePlugin extends Plugin {
   }
 
   openSyncLog(): void {
-    new SyncLogModal(this.app, this.syncLog).open();
+    new SyncLogModal(this.app, this.syncLog, this.transfers).open();
   }
 
   onunload(): void {
@@ -474,6 +474,14 @@ export default class SyncstonePlugin extends Plugin {
       transfers: this.transfers,
       log: this.syncLog,
       initialGlobalVersion: linkedVault.lastSyncedGlobalVersion,
+      // Kept on this device only (not in the settings, which can travel to other devices with the settings sync).
+      thoroughCheck: {
+        lastAt: () => {
+          const at: unknown = this.app.loadLocalStorage(`syncstone-thorough-check-${linkedVault.vaultId}`);
+          return typeof at === "number" ? at : null;
+        },
+        done: (at) => this.app.saveLocalStorage(`syncstone-thorough-check-${linkedVault.vaultId}`, at),
+      },
       onStateChange: async (state) => {
         this.settings.lastSyncAt = state.lastSyncAt;
         if (this.settings.linkedVault) {
@@ -764,7 +772,7 @@ export default class SyncstonePlugin extends Plugin {
     this.statusBar?.refresh();
     try {
       this.syncEngine.retryFailed();
-      await this.syncEngine.runFullSync();
+      await this.syncEngine.runFullSync({ thorough: true }); // the button checks every file
       await this.configSyncEngine?.run();
       const failed = this.syncEngine.failedCount;
       new Notice(failed > 0 ? t("p.syncPartial", { count: failed }) : t("p.syncDone"));

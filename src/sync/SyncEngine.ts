@@ -104,6 +104,11 @@ export interface SyncEngineDeps {
    * answer. Without it such files are brought back.
    */
   askAboutMissingFiles?: (count: number) => Promise<"delete" | "restore" | null>;
+  /**
+   * When this device last checked every file in full (read and compared each one). Kept per device. Without it every
+   * full sync is such a check.
+   */
+  thoroughCheck?: { lastAt: () => number | null; done: (at: number) => void };
   /** True while the account is read-only (trial / subscription over): uploads are skipped instead of being refused one by one. */
   isReadOnly?: () => boolean;
   /** The server refused a write because the account is read-only (402) or the storage quota is used up (413). */
@@ -126,6 +131,22 @@ function markerPathFor(folderPath: string): string {
 
 function isHiddenFolder(folderPath: string): boolean {
   return folderPath.split("/").some((segment) => segment.startsWith("."));
+}
+
+/** A full check of every file at least this often (otherwise files that did not change are not read again). */
+const THOROUGH_EVERY_MS = 24 * 60 * 60 * 1000;
+/** Files up to this size count as small: they go first (notes before large PDFs and images). */
+const SMALL_FILE_BYTES = 256 * 1024;
+/** New files up to this size are transferred several at once; larger ones one after the other. */
+const PARALLEL_MAX_BYTES = 1024 * 1024;
+const PARALLEL_TRANSFERS = 3;
+/** A file changed less than this before its size and time were noted is read again next time (coarse file times). */
+const RECENT_CHANGE_MS = 3000;
+
+/** Small files first, and of those the most recently changed first. */
+function byPriority<T>(items: T[], size: (item: T) => number, when: (item: T) => number): T[] {
+  const big = (item: T) => (size(item) > SMALL_FILE_BYTES ? 1 : 0);
+  return [...items].sort((a, b) => big(a) - big(b) || when(b) - when(a));
 }
 
 /**
@@ -196,6 +217,8 @@ export class SyncEngine {
    * another device's edit (that would merge it with the newer typing here and could write over it).
    */
   private readonly sentNotConfirmed = new Map<string, Array<{ hash: string; bytes: Uint8Array }>>();
+  /** The running full sync reads every file (see `runFullSync`). */
+  private thoroughRun = true;
   /** Files whose write was refused as outdated and are being merged right now (guards against going round in circles). */
   private readonly resolvingStale = new Set<string>();
 
@@ -270,9 +293,16 @@ export class SyncEngine {
   // Public entry points
   // ============================================================
 
-  async runFullSync(): Promise<void> {
+  /**
+   * `thorough`: every file is read and compared (the sync button does that). Otherwise files whose size and time did not
+   * change since they were last synced, and that are unchanged on the server too, are not read again; a thorough check
+   * still runs once a day.
+   */
+  async runFullSync(options: { thorough?: boolean } = {}): Promise<void> {
     if (this.deps.isPaused() || this.syncing) return;
     this.syncing = true;
+    const lastThorough = this.deps.thoroughCheck?.lastAt() ?? null;
+    this.thoroughRun = options.thorough === true || !this.deps.thoroughCheck || lastThorough === null || Date.now() - lastThorough >= THOROUGH_EVERY_MS;
     // A full sync moves the cursor while it works. If it dies half way, the files it did not reach must be fetched
     // again by the next poll - so the cursor goes back to where it was instead of staying at the newest version seen.
     const cursorBefore = this.currentGlobalVersion;
@@ -287,7 +317,10 @@ export class SyncEngine {
       if (this.runFailures > 0) {
         this.currentGlobalVersion = cursorBefore;
         this.fullSyncRetryAt = Date.now() + FAILURE_BACKOFF_MS;
-      } else this.fullSyncRetryAt = null;
+      } else {
+        this.fullSyncRetryAt = null;
+        if (this.thoroughRun) this.deps.thoroughCheck?.done(Date.now());
+      }
       await this.persistState();
       log?.add({ kind: "summary", args: [log.total("up") - upBefore, log.total("down") - downBefore, this.runFailures] });
     } catch (err) {
@@ -699,9 +732,22 @@ export class SyncEngine {
     const missingMode = this.decideMissingFiles(indexRecords, localByPath, remoteById);
 
     // --- Phase A ---
+    // What probably changed comes first, small files before large ones, the newest first.
+    const changedFirst = new Map(
+      indexRecords.map((record) => {
+        const item = remoteById.get(record.fileId);
+        const local = localByPath.get(record.localPath);
+        return [record.fileId, !item || !local || !this.unchangedHere(record, item, local)] as const;
+      }),
+    );
+    const orderedRecords = byPriority(
+      indexRecords,
+      (record) => remoteById.get(record.fileId)?.contentSize ?? localByPath.get(record.localPath)?.stat.size ?? 0,
+      (record) => Math.max(Date.parse(remoteById.get(record.fileId)?.updatedAt ?? "") || 0, localByPath.get(record.localPath)?.stat.mtime ?? 0),
+    ).sort((a, b) => Number(changedFirst.get(b.fileId)) - Number(changedFirst.get(a.fileId)));
     // Renames whose new name is still taken by another file of this pass (swapped names) are retried at the end.
     const deferred: LocalIndexRecord[] = [];
-    for (const record of indexRecords) {
+    for (const record of orderedRecords) {
       if (this.disposed) return;
       await this.attempt(record.fileId, record.localPath, () =>
         this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, missingMode, deferred)),
@@ -745,10 +791,11 @@ export class SyncEngine {
     }
 
     // --- Phase B ---
-    for (const item of remoteResp.files) {
-      if (this.disposed) return;
-      if (item.isDeleted || knownFileIds.has(item.id)) continue;
-
+    // Small files first and the newest first. Small files that have nothing of the same name here (in any upper/lower
+    // case) come down several at once; everything else one after the other.
+    const incoming: Array<{ item: DecodedFileListItem; path: string }> = [];
+    const newRemote = remoteResp.files.filter((item) => !item.isDeleted && !knownFileIds.has(item.id));
+    for (const item of byPriority(newRemote, (f) => f.contentSize, (f) => Date.parse(f.updatedAt) || 0)) {
       let path: string;
       try {
         path = await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce);
@@ -757,49 +804,39 @@ export class SyncEngine {
         continue;
       }
       if (this.deps.isConfigPath(path) || handledPaths.has(path)) continue;
-
-      let placedAt = path;
-      let localTwinPath: string | null = null;
-      await this.attempt(item.id, path, async () => {
-        // A note of the same name here (also written with other upper/lower case) is the same note: compared and merged.
-        const twin = localByPath.get(path) ?? this.deps.fs.getFileByPathIgnoringCase(path);
-        const owner = twin && twin.path !== path ? await this.deps.localIndex.getByPath(twin.path) : undefined;
-        if (twin && owner && owner.fileId !== item.id) {
-          // ...unless it is another file of the vault: two names that differ only in case cannot live side by side.
-          await this.withFileLock(item.id, async () => {
-            placedAt = await this.settleCaseClash(item, undefined, path, owner, twin);
-            if (!this.deps.fs.getFileByPath(placedAt)) await this.downloadFile(item, placedAt, "new");
-          });
-          return;
-        }
-        await this.withFileLock(item.id, async () => {
-          if (twin) {
-            placedAt = twin.path;
-            localTwinPath = twin.path;
-            await this.reconcileExisting(item, twin.path, twin);
-            // Written with other upper/lower case here: takes the server's name, like on the other devices.
-            const record = await this.deps.localIndex.get(item.id);
-            if (twin.path !== path && record?.localPath === twin.path && (await this.moveLocal(twin.path, path))) {
-              await this.deps.localIndex.put({ ...record, localPath: path });
-              placedAt = path;
-            }
-          } else {
-            await this.downloadFile(item, path, "new");
-          }
-        });
-      });
-      handledPaths.add(path);
-      handledPaths.add(placedAt);
-      if (localTwinPath) handledPaths.add(localTwinPath); // the same file under the name it had before
+      incoming.push({ item, path });
+    }
+    const sameName = new Map<string, number>();
+    for (const { path } of incoming) sameName.set(path.toLowerCase(), (sameName.get(path.toLowerCase()) ?? 0) + 1);
+    const together = new Set(
+      incoming.filter(
+        ({ item, path }) =>
+          item.contentSize <= PARALLEL_MAX_BYTES && sameName.get(path.toLowerCase()) === 1 && !localByPath.has(path) && !this.deps.fs.getFileByPathIgnoringCase(path),
+      ),
+    );
+    await this.inParallel([...together], ({ item, path }) => this.bringInNew(item, path, localByPath, handledPaths));
+    for (const entry of incoming) {
+      if (this.disposed) return;
+      if (!together.has(entry)) await this.bringInNew(entry.item, entry.path, localByPath, handledPaths);
     }
 
     // --- Phase C ---
-    for (const [path, file] of localByPath) {
-      if (this.disposed) return;
-      if (handledPaths.has(path)) continue;
+    // New files here: small ones several at once, small and new first.
+    const newHere = byPriority(
+      [...localByPath].filter(([path]) => !handledPaths.has(path)),
+      ([, file]) => file.stat.size,
+      ([, file]) => file.stat.mtime,
+    );
+    const sendNew = async ([path, file]: [string, TFile]) => {
+      if (handledPaths.has(path)) return;
+      handledPaths.add(path);
       const fileId = crypto.randomUUID();
       await this.attempt(`path:${path}`, path, () => this.withFileLock(fileId, () => this.uploadFile(file, fileId, undefined, "new", null)));
-      handledPaths.add(path);
+    };
+    await this.inParallel(newHere.filter(([, file]) => file.stat.size <= PARALLEL_MAX_BYTES), sendNew);
+    for (const entry of newHere) {
+      if (this.disposed) return;
+      if (entry[1].stat.size > PARALLEL_MAX_BYTES) await sendNew(entry);
     }
 
     // --- Phase D: empty local folders get a marker so they exist on the other devices as well ---
@@ -810,6 +847,85 @@ export class SyncEngine {
       await this.attempt(`path:${markerPath}`, folder.path, () => this.withFileLock(fileId, () => this.uploadMarker(fileId, markerPath)));
       handledPaths.add(markerPath);
     }
+  }
+
+  /**
+   * Runs `work` for every item, up to `PARALLEL_TRANSFERS` at a time. Errors of single files are handled inside
+   * `attempt`; an error that ends the run (offline, signed out) stops taking new items and is passed on once the running
+   * ones are done.
+   */
+  private async inParallel<T>(items: T[], work: (item: T) => Promise<void>): Promise<void> {
+    let next = 0;
+    let failed = false;
+    let failure: unknown;
+    const lane = async () => {
+      while (!failed && !this.disposed && next < items.length) {
+        const item = items[next++];
+        try {
+          await work(item);
+        } catch (err) {
+          if (!failed) failure = err;
+          failed = true;
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(PARALLEL_TRANSFERS, items.length) }, lane));
+    if (failed) throw failure;
+  }
+
+  /**
+   * The file of this size and time here was last found to have the content that the server still has: nothing to read.
+   * A thorough sync never takes this shortcut.
+   */
+  private unchangedHere(record: LocalIndexRecord, item: DecodedFileListItem, file: TFile): boolean {
+    const stamp = record.localStamp;
+    return (
+      !!stamp &&
+      stamp.hash === record.lastContentHashBlinded &&
+      toBase64(item.contentHashBlinded) === record.lastContentHashBlinded &&
+      item.version === record.lastKnownVersion &&
+      file.stat.size === stamp.size &&
+      file.stat.mtime === stamp.mtime &&
+      stamp.mtime + RECENT_CHANGE_MS < stamp.at
+    );
+  }
+
+  /** A file of the server that this device does not know yet (Phase B of the full sync). */
+  private async bringInNew(item: DecodedFileListItem, path: string, localByPath: Map<string, TFile>, handledPaths: Set<string>): Promise<void> {
+    if (handledPaths.has(path)) return;
+    let placedAt = path;
+    let localTwinPath: string | null = null;
+    await this.attempt(item.id, path, async () => {
+      // A note of the same name here (also written with other upper/lower case) is the same note: compared and merged.
+      const twin = localByPath.get(path) ?? this.deps.fs.getFileByPathIgnoringCase(path);
+      const owner = twin && twin.path !== path ? await this.deps.localIndex.getByPath(twin.path) : undefined;
+      if (twin && owner && owner.fileId !== item.id) {
+        // ...unless it is another file of the vault: two names that differ only in case cannot live side by side.
+        await this.withFileLock(item.id, async () => {
+          placedAt = await this.settleCaseClash(item, undefined, path, owner, twin);
+          if (!this.deps.fs.getFileByPath(placedAt)) await this.downloadFile(item, placedAt, "new");
+        });
+        return;
+      }
+      await this.withFileLock(item.id, async () => {
+        if (twin) {
+          placedAt = twin.path;
+          localTwinPath = twin.path;
+          await this.reconcileExisting(item, twin.path, twin);
+          // Written with other upper/lower case here: takes the server's name, like on the other devices.
+          const record = await this.deps.localIndex.get(item.id);
+          if (twin.path !== path && record?.localPath === twin.path && (await this.moveLocal(twin.path, path))) {
+            await this.deps.localIndex.put({ ...record, localPath: path });
+            placedAt = path;
+          }
+        } else {
+          await this.downloadFile(item, path, "new");
+        }
+      });
+    });
+    handledPaths.add(path);
+    handledPaths.add(placedAt);
+    if (localTwinPath) handledPaths.add(localTwinPath); // the same file under the name it had before
   }
 
   /**
@@ -872,7 +988,9 @@ export class SyncEngine {
       const local = localByPath.get(path);
       if (!record || !local) paths.push(path); // new here, or gone here: comes down
       else if (item.version > record.lastKnownVersion) paths.push(path); // changed on another device
-      else if (local.stat.mtime > Date.parse(record.lastSyncedAt) + 2000) paths.push(path); // changed here since
+      else if (record.localStamp ? local.stat.mtime !== record.localStamp.mtime || local.stat.size !== record.localStamp.size : local.stat.mtime > Date.parse(record.lastSyncedAt) + 2000) {
+        paths.push(path); // changed here since
+      }
     }
     for (const path of localByPath.keys()) {
       if (relevant(path) && !remotePaths.has(path) && !indexedPaths.has(path)) paths.push(path); // new here: goes up
@@ -977,6 +1095,10 @@ export class SyncEngine {
       return;
     }
 
+    if (!this.thoroughRun && samePath && this.unchangedHere(record, remoteItem, currentLocalFile)) {
+      this.bumpGlobalVersion(remoteItem.version);
+      return;
+    }
     await this.reconcileExisting(remoteItem, path, currentLocalFile);
   }
 
@@ -1380,6 +1502,7 @@ export class SyncEngine {
   }
 
   private async reconcileExistingOnce(item: DecodedFileListItem, path: string, localFile: TFile): Promise<void> {
+    const statBefore = { size: localFile.stat.size, mtime: localFile.stat.mtime, at: Date.now() };
     const localBytes = await this.readLocal(localFile);
     if (!localBytes) return; // deleted while the sync was busy: the delete event takes care of it
     const localHash = await this.deps.crypto.hashContent(localBytes);
@@ -1394,6 +1517,7 @@ export class SyncEngine {
         lastKnownVersion: item.version,
         lastContentHashBlinded: remoteHashBase64,
         lastSyncedAt: new Date().toISOString(),
+        localStamp: { ...statBefore, hash: remoteHashBase64 },
       });
       await this.rememberBase(item.id, path, localBytes, localHashBase64);
       this.bumpGlobalVersion(item.version);
@@ -1452,7 +1576,7 @@ export class SyncEngine {
       if (bothChanged && !copied && !(Platform.isMobile && item.contentSize > this.mobileLimit())) {
         await this.saveConflictCopy(path, await this.fetchRemotePlaintext(item));
       }
-      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: localHash }, bothChanged ? "newer" : "local", remoteHashBase64);
+      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: localHash, stat: statBefore }, bothChanged ? "newer" : "local", remoteHashBase64);
     }
   }
 
@@ -1617,7 +1741,7 @@ export class SyncEngine {
   private async uploadFile(
     file: TFile,
     fileId: string,
-    precomputed: { plaintext: Uint8Array; hash: Uint8Array } | undefined,
+    precomputed: { plaintext: Uint8Array; hash: Uint8Array; stat?: { size: number; mtime: number; at: number } } | undefined,
     why: LogReason | undefined,
     base: string | null,
   ): Promise<void> {
@@ -1646,6 +1770,8 @@ export class SyncEngine {
     let hash: Uint8Array | undefined;
     let uploadedPlaintext: Uint8Array | undefined;
     let stale: DecodedFileListItem | null = null;
+    // Size and time before the content was read (see `LocalIndexRecord.localStamp`).
+    const statBefore = precomputed ? precomputed.stat : { size: file.stat.size, mtime: file.stat.mtime, at: Date.now() };
     try {
       const plaintext = precomputed?.plaintext ?? (await this.readLocal(file));
       if (!plaintext) return; // deleted while it was being read
@@ -1696,6 +1822,7 @@ export class SyncEngine {
       lastKnownVersion: result.version,
       lastContentHashBlinded: toBase64(hash),
       lastSyncedAt: new Date().toISOString(),
+      ...(statBefore ? { localStamp: { ...statBefore, hash: toBase64(hash) } } : {}),
     };
     await this.deps.localIndex.put(record);
     this.sentNotConfirmed.delete(fileId);

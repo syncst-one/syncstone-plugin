@@ -23,6 +23,13 @@ export interface LocalIndexRecord {
   lastContentHashBlinded: string;
   /** ISO timestamp. */
   lastSyncedAt: string;
+  /**
+   * Size and modification time the file here had when its content was found to be `hash` (taken before it was read).
+   * While the file still has exactly this size and time and the server still has `hash`, a full sync does not need to
+   * read it again. Only valid while `hash` equals `lastContentHashBlinded`. `at`: when the size and time were taken (a
+   * file changed just before that is read again next time, as file times can be as coarse as 2 seconds).
+   */
+  localStamp?: { size: number; mtime: number; at: number; hash: string };
 }
 
 const STORE_NAME = "files";

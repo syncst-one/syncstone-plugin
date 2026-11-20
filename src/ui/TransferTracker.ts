@@ -131,6 +131,17 @@ export class TransferTracker {
     this.failed.delete(path);
   }
 
+  /** What is being transferred right now, and how many files wait for their turn. */
+  current(): { active: Array<{ path: string; loaded: number; total: number }>; queued: number } {
+    const active: Array<{ path: string; loaded: number; total: number }> = [];
+    let queued = 0;
+    for (const [path, transfer] of this.transfers) {
+      if (transfer.state === "active") active.push({ path, loaded: transfer.loaded, total: transfer.total });
+      else if (transfer.state === "queued" && !transfer.passive) queued++;
+    }
+    return { active, queued };
+  }
+
   failedFiles(): FailedFile[] {
     return [...this.failed].map(([path, reason]) => ({ path, reason }));
   }
