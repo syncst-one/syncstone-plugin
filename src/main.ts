@@ -274,9 +274,29 @@ export default class SyncstonePlugin extends Plugin {
         this.blockedNoticeShown = null;
         void this.syncEngine?.runFullSync().catch((err) => console.error("Syncstone: Sync nach Freigabe fehlgeschlagen", err));
       }
-    } catch {
-      // Offline or the server is busy: keep what we knew.
+    } catch (err) {
+      // The session was ended while this device was offline (signed out in the browser, revoked): sign out here too.
+      if (err instanceof SyncstoneApiError && err.status === 401) await this.handleSessionEnded();
+      // Otherwise offline or the server is busy: keep what we knew.
     }
+  }
+
+  /**
+   * The server ended this device's session (signed out from the browser, revoked by an admin). Forget the token like the
+   * logout button does - the linked vault stays, so signing in again picks up where it left off - stop syncing and
+   * show the settings as signed out.
+   */
+  async handleSessionEnded(): Promise<void> {
+    if (!this.settings.sessionToken) return;
+    this.settings.sessionToken = null;
+    this.settings.sessionExpiresAt = null;
+    this.settings.accountUsername = null;
+    this.account = null;
+    await this.saveSettings();
+    await this.tryStartSync(); // stops sync - sessionToken is gone
+    this.statusBar?.refresh();
+    if (this.settingsTab?.containerEl.isConnected) this.settingsTab.display();
+    new Notice(t("session.ended"), 15_000);
   }
 
   /**
@@ -458,6 +478,8 @@ export default class SyncstonePlugin extends Plugin {
       isConfigPath: (path) => this.isConfigPath(path),
       isCollabLive: (fileId) => this.collabManager?.isLive(fileId) ?? false,
       isCollabWriter: (fileId) => this.collabManager?.isWriter(fileId) ?? true,
+      collabAuthors: (fileId) => this.collabManager?.authorsFor(fileId) ?? null,
+      collabAuthorsSent: (fileId, sent) => this.collabManager?.authorsSent(fileId, sent),
       saveOpenEditor: async (path) => {
         let open = false;
         for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
@@ -551,9 +573,16 @@ export default class SyncstonePlugin extends Plugin {
     // The first sync of a big vault takes minutes. It runs in the background: unlocking / signing in is finished at once
     // (the status icon and the explorer rings show the progress) instead of the settings tab waiting for every file.
     const configSyncEngine = this.configSyncEngine;
+    const firstSync = linkedVault.lastSyncedGlobalVersion === 0;
     void (async () => {
       try {
         await syncEngine.runFullSync();
+        // The very first sync of this vault on this device can take minutes, and on a phone nothing else shows its end.
+        if (firstSync && this.syncEngine === syncEngine) {
+          const failed = syncEngine.failedCount;
+          const files = (await localIndex.getAll().catch(() => [])).length;
+          new Notice(failed > 0 ? t("p.syncPartial", { count: failed }) : t("p.firstSyncDone", { count: files }));
+        }
       } catch (err) {
         // Stopped meanwhile (unlinked, signed out, locked): the failure is a consequence of that, not news.
         if (this.syncEngine === syncEngine) {
@@ -636,7 +665,7 @@ export default class SyncstonePlugin extends Plugin {
           this.statusBar?.refresh();
         },
         (message) => collabManager.handleServerMessage(message),
-        () => new Notice(t("session.ended"), 15_000),
+        () => void this.handleSessionEnded(),
       );
     }
     this.statusBar?.refresh();
@@ -768,13 +797,16 @@ export default class SyncstonePlugin extends Plugin {
       new Notice(t("p.noVaultOrPaused"));
       return;
     }
-    new Notice(t("p.syncStarted"));
+    const engine = this.syncEngine;
+    // A sync already running (the first one after start, a poll) is waited for, so "finished" only comes once it really is.
+    new Notice(engine.isSyncing ? t("p.syncRunning") : t("p.syncStarted"));
     this.statusBar?.refresh();
     try {
-      this.syncEngine.retryFailed();
-      await this.syncEngine.runFullSync({ thorough: true }); // the button checks every file
+      engine.retryFailed();
+      await engine.runFullSyncNow({ thorough: true }); // the button checks every file
+      if (this.syncEngine !== engine) return; // stopped meanwhile (signed out, unlinked)
       await this.configSyncEngine?.run();
-      const failed = this.syncEngine.failedCount;
+      const failed = engine.failedCount;
       new Notice(failed > 0 ? t("p.syncPartial", { count: failed }) : t("p.syncDone"));
     } catch (err) {
       console.error("Syncstone: Synchronisierung fehlgeschlagen", err);

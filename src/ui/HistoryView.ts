@@ -1,8 +1,9 @@
 import { t } from "../i18n/index.js";
 import { ItemView, TFile, setIcon, type WorkspaceLeaf } from "obsidian";
-import { actionIcon, actionLabel, dayLabel, displayPath, entryKind, fromBase64, timeLabel, whoLabel, type RevisionEntry } from "@websync/shared";
+import { actionIcon, actionLabel, dayLabel, displayPath, entryKind, fromBase64, timeLabel } from "@websync/shared";
 import type SyncstonePlugin from "../main.js";
 import { baseName, formatBytes } from "./historyFormat.js";
+import { authorsLabel, groupEdits, mixesAccounts, toHistoryEntry, type HistoryEntry } from "./historyGroups.js";
 
 export const HISTORY_VIEW_TYPE = "syncstone-history";
 
@@ -15,7 +16,9 @@ export class HistoryView extends ItemView {
   private mode: "file" | "vault" = "file";
   /** A file picked via the file menu; it wins until another file becomes active. */
   private pin: { fileId: string; activePath: string | null } | null = null;
-  private entries: RevisionEntry[] = [];
+  private entries: HistoryEntry[] = [];
+  /** Edit blocks the user opened, by the id of their newest version. */
+  private expanded = new Set<string>();
   private nextBefore: number | null = null;
   private retentionDays = 0;
   private loading = false;
@@ -147,26 +150,14 @@ export class HistoryView extends ItemView {
     try {
       const page = await this.plugin.remoteApi.getHistory(vaultId, fileId, before);
       const decrypted = await Promise.all(
-        page.revisions.map(async (r): Promise<RevisionEntry> => {
+        page.revisions.map(async (r): Promise<HistoryEntry> => {
           let path: string | null = null;
           try {
             path = await this.plugin.cryptoService.decryptPath(fromBase64(r.pathCiphertext), fromBase64(r.pathNonce));
           } catch {
             /* shown as unreadable */
           }
-          return {
-            id: r.id,
-            fileId: r.fileId,
-            version: r.version,
-            action: r.action,
-            path,
-            size: r.contentSize,
-            hash: r.contentHashBlinded,
-            hasContent: r.hasContent,
-            deviceName: r.deviceName,
-            username: r.username,
-            createdAt: r.createdAt,
-          };
+          return toHistoryEntry(r, path);
         }),
       );
       if (id !== this.request) return;
@@ -247,22 +238,53 @@ export class HistoryView extends ItemView {
     setIcon(refresh, "refresh-cw");
     refresh.onclick = () => void this.reload();
 
-    const accounts = new Set(this.entries.map((e) => e.username).filter(Boolean)).size > 1;
+    const accounts = mixesAccounts(this.entries);
+    const unknown = t("history.unknownDevice");
     const list = el.createDiv({ cls: "syncstone-history-list" });
-    this.entries.forEach((entry, index) => {
-      const row = list.createDiv({ cls: `syncstone-history-item${entry.id === this.selectedId ? " is-selected" : ""}` });
-      const icon = row.createDiv({ cls: `syncstone-history-icon is-${entry.action}` });
-      setIcon(icon, actionIcon(entry));
+    const blocks = groupEdits(this.entries);
+    blocks.forEach((block, blockIndex) => {
+      const newest = block[0];
+      const oldest = block[block.length - 1];
+      const isBlock = block.length > 1;
+      const open = isBlock && this.expanded.has(newest.id);
+      const selected = block.some((entry) => entry.id === this.selectedId);
+      const row = list.createDiv({ cls: `syncstone-history-item${selected && (!open || newest.id === this.selectedId) ? " is-selected" : ""}` });
+      setIcon(row.createDiv({ cls: `syncstone-history-icon is-${newest.action}` }), actionIcon(newest));
       const body = row.createDiv({ cls: "syncstone-history-body" });
-      const head = body.createDiv({ cls: "syncstone-history-line", text: `${dayLabel(entry.createdAt)}, ${timeLabel(entry.createdAt)}` });
-      if (this.mode === "file" && index === 0 && entry.action !== "delete") head.createSpan({ cls: "syncstone-history-badge", text: t("p.current") });
-      const size = entry.action !== "rename" && entry.action !== "delete" ? ` · ${formatBytes(entry.size)}` : "";
-      body.createDiv({ cls: "syncstone-history-note", text: `${actionLabel(entry)} · ${whoLabel(entry, accounts)}${size}` });
+      const when = isBlock
+        ? `${dayLabel(newest.createdAt)}, ${timeLabel(oldest.createdAt)}–${timeLabel(newest.createdAt)}`
+        : `${dayLabel(newest.createdAt)}, ${timeLabel(newest.createdAt)}`;
+      const head = body.createDiv({ cls: "syncstone-history-line", text: when });
+      if (blockIndex === 0 && newest.action !== "delete") head.createSpan({ cls: "syncstone-history-badge", text: t("p.current") });
+      const what = isBlock ? t("p.versionsCount", { count: block.length }) : actionLabel(newest);
+      const size = newest.action !== "rename" && newest.action !== "delete" ? ` · ${formatBytes(newest.size)}` : "";
+      body.createDiv({ cls: "syncstone-history-note", text: `${what} · ${authorsLabel(block, accounts, unknown)}${size}` });
       row.onclick = () => {
-        this.selectedId = entry.id;
+        this.selectedId = newest.id;
         this.render();
-        void this.plugin.openRevisionDiff(entry.fileId, entry.id);
+        void this.plugin.openRevisionDiff(newest.fileId, newest.id);
       };
+      if (!isBlock) return;
+      const chevron = row.createDiv({ cls: "syncstone-history-expand clickable-icon", attr: { "aria-label": open ? t("p.collapse") : t("p.expand") } });
+      setIcon(chevron, open ? "chevron-down" : "chevron-right");
+      chevron.onclick = (event) => {
+        event.stopPropagation();
+        if (open) this.expanded.delete(newest.id);
+        else this.expanded.add(newest.id);
+        this.render();
+      };
+      if (!open) return;
+      // The single versions of the block, indented under it: each one opens like any other version.
+      for (const entry of block) {
+        const sub = list.createDiv({ cls: `syncstone-history-item is-sub${entry.id === this.selectedId ? " is-selected" : ""}` });
+        const subBody = sub.createDiv({ cls: "syncstone-history-body" });
+        subBody.createDiv({ cls: "syncstone-history-note", text: `${timeLabel(entry.createdAt)} · ${authorsLabel([entry], accounts, unknown)} · ${formatBytes(entry.size)}` });
+        sub.onclick = () => {
+          this.selectedId = entry.id;
+          this.render();
+          void this.plugin.openRevisionDiff(entry.fileId, entry.id);
+        };
+      }
     });
   }
 
@@ -297,15 +319,22 @@ export class HistoryView extends ItemView {
   private renderVaultList(host: HTMLElement): void {
     host.empty();
     const q = this.query.trim().toLowerCase();
-    const accounts = new Set(this.entries.map((e) => e.username).filter(Boolean)).size > 1;
+    const accounts = mixesAccounts(this.entries);
+    const unknown = t("history.unknownDevice");
     let day = "";
     let shown = 0;
-    for (const entry of this.entries) {
+    const visible = this.entries.filter((entry) => {
       const kind = entryKind(entry);
-      if (!this.showSettings && kind === "settings") continue;
-      if (this.onlyDeleted && entry.action !== "delete") continue;
+      if (!this.showSettings && kind === "settings") return false;
+      if (this.onlyDeleted && entry.action !== "delete") return false;
       const path = displayPath(entry);
-      if (q && !path.toLowerCase().includes(q) && !(entry.deviceName ?? "").toLowerCase().includes(q)) continue;
+      return !q || path.toLowerCase().includes(q) || authorsLabel([entry], true, unknown).toLowerCase().includes(q);
+    });
+    for (const block of groupEdits(visible)) {
+      const entry = block[0];
+      const oldest = block[block.length - 1];
+      const kind = entryKind(entry);
+      const path = displayPath(entry);
       const label = dayLabel(entry.createdAt);
       if (label !== day) {
         day = label;
@@ -316,7 +345,9 @@ export class HistoryView extends ItemView {
       setIcon(row.createDiv({ cls: `syncstone-history-icon is-${entry.action}` }), actionIcon(entry));
       const body = row.createDiv({ cls: "syncstone-history-body" });
       body.createDiv({ cls: `syncstone-history-line${entry.action === "delete" ? " is-deleted" : ""}`, text: path, attr: { title: path } });
-      body.createDiv({ cls: "syncstone-history-note", text: `${timeLabel(entry.createdAt)} · ${actionLabel(entry)} · ${whoLabel(entry, accounts)}` });
+      const when = block.length > 1 ? `${timeLabel(oldest.createdAt)}–${timeLabel(entry.createdAt)}` : timeLabel(entry.createdAt);
+      const what = block.length > 1 ? t("p.versionsCount", { count: block.length }) : actionLabel(entry);
+      body.createDiv({ cls: "syncstone-history-note", text: `${when} · ${what} · ${authorsLabel(block, accounts, unknown)}` });
       if (kind !== "folder") {
         row.onclick = () => {
           this.mode = "file";

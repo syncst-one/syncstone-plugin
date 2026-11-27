@@ -1,8 +1,9 @@
 import { currentLocale, t } from "../i18n/index.js";
 import { ItemView, Notice, TFile, normalizePath, setIcon, type WorkspaceLeaf } from "obsidian";
-import { actionLabel, diffLines, fromBase64, numberDiffLines, unpackBlob, whoLabel, withContext, type RevisionEntry } from "@websync/shared";
+import { actionLabel, diffLines, fromBase64, numberDiffLines, unpackBlob, withContext, type RevisionEntry } from "@websync/shared";
 import type SyncstonePlugin from "../main.js";
 import { baseName, decoder, extOf, formatBytes, IMAGE_EXT, MAX_PREVIEW_BYTES, parentOf, TEXT_EXT } from "./historyFormat.js";
+import { authorsLabel, toHistoryEntry, type HistoryEntry } from "./historyGroups.js";
 
 export const HISTORY_DIFF_VIEW_TYPE = "syncstone-history-diff";
 
@@ -13,7 +14,7 @@ export const HISTORY_DIFF_VIEW_TYPE = "syncstone-history-diff";
 export class HistoryDiffView extends ItemView {
   private fileId: string | null = null;
   private revisionId: string | null = null;
-  private entries: RevisionEntry[] = [];
+  private entries: HistoryEntry[] = [];
   private retentionDays = 0;
   private loading = true;
   private error: string | null = null;
@@ -77,26 +78,14 @@ export class HistoryDiffView extends ItemView {
     try {
       const page = await this.plugin.remoteApi.getHistory(vaultId, fileId);
       const decrypted = await Promise.all(
-        page.revisions.map(async (r): Promise<RevisionEntry> => {
+        page.revisions.map(async (r): Promise<HistoryEntry> => {
           let path: string | null = null;
           try {
             path = await this.plugin.cryptoService.decryptPath(fromBase64(r.pathCiphertext), fromBase64(r.pathNonce));
           } catch {
             /* shown as unreadable */
           }
-          return {
-            id: r.id,
-            fileId: r.fileId,
-            version: r.version,
-            action: r.action,
-            path,
-            size: r.contentSize,
-            hash: r.contentHashBlinded,
-            hasContent: r.hasContent,
-            deviceName: r.deviceName,
-            username: r.username,
-            createdAt: r.createdAt,
-          };
+          return toHistoryEntry(r, path);
         }),
       );
       if (id !== this.request) return;
@@ -227,7 +216,7 @@ export class HistoryDiffView extends ItemView {
     meta.createDiv({ cls: "syncstone-revdiff-title", text: baseName(title), attr: { title } });
     meta.createDiv({
       cls: "syncstone-history-note",
-      text: t("p.diff.meta", { action: actionLabel(entry), date: new Date(entry.createdAt).toLocaleString(currentLocale(), { dateStyle: "long", timeStyle: "short" }), who: whoLabel(entry, true) }),
+      text: t("p.diff.meta", { action: actionLabel(entry), date: new Date(entry.createdAt).toLocaleString(currentLocale(), { dateStyle: "long", timeStyle: "short" }), who: authorsLabel([entry], true, t("history.unknownDevice")) }),
     });
 
     const actions = header.createDiv({ cls: "syncstone-revdiff-actions" });

@@ -43,6 +43,8 @@ export class CollabSession {
   private readonly awarenessClientsByPeer = new Map<string, Set<number>>();
   private awarenessTimer: ReturnType<typeof window.setTimeout> | null = null;
   private destroyed = false;
+  /** Called when this device changed the text (typing, a paste), not for edits that came from a peer. */
+  onLocalEdit: (() => void) | null = null;
 
   constructor(
     private readonly send: CollabSend,
@@ -50,6 +52,7 @@ export class CollabSession {
   ) {
     this.doc.on("update", (update: Uint8Array, origin: unknown) => {
       if (this.destroyed || origin === REMOTE_ORIGIN || origin === SEED_ORIGIN) return;
+      this.onLocalEdit?.();
       this.send(CollabKind.Update, update);
     });
 

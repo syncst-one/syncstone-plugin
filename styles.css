@@ -379,6 +379,18 @@ details[open] > .syncstone-section-title::before {
 .syncstone-history-item.is-selected {
   background: var(--background-modifier-active-hover);
 }
+/* An edit block opened: its single versions, indented under it. */
+.syncstone-history-item.is-sub {
+  padding: 3px 6px 3px 30px;
+}
+.syncstone-history-expand {
+  flex: none;
+  padding: 2px;
+}
+.syncstone-history-expand svg {
+  width: 14px;
+  height: 14px;
+}
 .syncstone-history-icon {
   display: flex;
   flex: none;

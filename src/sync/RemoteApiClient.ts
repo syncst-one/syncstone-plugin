@@ -70,6 +70,12 @@ export interface UploadFilePayload {
   editSessionId?: string;
   /** See `UploadFileMetaSchema.baseHash`: the content (blinded hash, base64) this write changes, null for a new file. */
   baseHash?: string | null;
+  /**
+   * Live collaboration: the other members of the note's live session whose edits are in this write (their connection
+   * ids, which the server maps to the account and device), and whether this device typed too. The version history shows
+   * them as the authors instead of only the device that happened to upload. Servers that don't know it ignore it.
+   */
+  coEditors?: { peers: string[]; self: boolean };
 }
 
 /** Bytes done / total of one transfer (the encrypted blob, so a bit larger than the file). */
@@ -204,13 +210,14 @@ export class RemoteApiClient {
 
   /** `shouldStop`: asked between the chunks of a large file - true ends the upload (the file was deleted meanwhile). */
   async uploadFile(vaultId: string, fileId: string, payload: UploadFilePayload, onProgress?: TransferProgress, shouldStop?: () => boolean): Promise<UploadFileResult> {
-    const meta: UploadFileMeta = {
+    const meta: UploadFileMeta & Pick<UploadFilePayload, "coEditors"> = {
       pathCiphertext: toBase64(payload.pathCiphertext),
       pathNonce: toBase64(payload.pathNonce),
       contentHashBlinded: toBase64(payload.contentHashBlinded),
       contentSize: payload.contentSize,
       editSessionId: payload.editSessionId,
       baseHash: payload.baseHash,
+      ...(payload.coEditors ? { coEditors: payload.coEditors } : {}),
     };
 
     const total = payload.contentIv.length + payload.contentCiphertext.length;

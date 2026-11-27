@@ -79,6 +79,19 @@ interface Room {
   boundEditor: EditorView | null;
   stateRequestAttempts: number;
   stateRequestTimer: ReturnType<typeof window.setTimeout> | null;
+  /**
+   * Who changed the text since this device last wrote the note to the server: the peers whose edits arrived, and whether
+   * this device typed too. Only the host writes during a session, so its upload says who else's work is in it (the
+   * version history shows them). Kept after the session ends: the host's next write still carries their edits.
+   */
+  editedBy: Set<string>;
+  editedHere: boolean;
+}
+
+/** What `CollabManager.authorsFor` hands the sync engine for one upload. */
+export interface CollabAuthors {
+  peers: string[];
+  self: boolean;
 }
 
 /**
@@ -149,6 +162,25 @@ export class CollabManager {
     const room = this.rooms.get(fileId);
     if (!room?.session) return true;
     return room.synced && this.isHost(room);
+  }
+
+  /**
+   * Read by SyncEngine before it writes `fileId`: who else changed the text since the last write (null when nobody did,
+   * i.e. this device edited alone and the upload speaks for itself).
+   */
+  authorsFor(fileId: string): CollabAuthors | null {
+    const room = this.rooms.get(fileId);
+    if (!room || room.editedBy.size === 0) return null;
+    // Peer ids are per connection, so a long session collects a few; the newest dozens are plenty to name everybody.
+    return { peers: [...room.editedBy].slice(-32), self: room.editedHere };
+  }
+
+  /** The write with `sent` went through: those edits are accounted for. */
+  authorsSent(fileId: string, sent: CollabAuthors): void {
+    const room = this.rooms.get(fileId);
+    if (!room) return;
+    for (const peer of sent.peers) room.editedBy.delete(peer);
+    if (sent.self) room.editedHere = false;
   }
 
   /** The other devices co-editing `path` right now (null if that note isn't being co-edited). */
@@ -335,6 +367,8 @@ export class CollabManager {
       boundEditor: null,
       stateRequestAttempts: 0,
       stateRequestTimer: null,
+      editedBy: new Set(),
+      editedHere: false,
     });
     this.deps.send({ type: "collab_join", fileId });
   }
@@ -444,7 +478,10 @@ export class CollabManager {
         await this.applyStateReply(room, opened.payload);
         break;
       case CollabKind.Update:
-        room.session?.applyRemoteUpdate(opened.payload);
+        if (room.session) {
+          room.session.applyRemoteUpdate(opened.payload);
+          room.editedBy.add(message.from);
+        }
         break;
       case CollabKind.Awareness:
         room.session?.applyRemoteAwareness(message.from, opened.payload);
@@ -476,6 +513,10 @@ export class CollabManager {
       name: me.deviceName,
       color: colorFor(me.colorIndex),
     });
+    session.onLocalEdit = () => {
+      // A local edit after others typed: this device's share of the next write. Alone, the upload is this device's anyway.
+      room.editedHere = true;
+    };
     room.session = session;
     room.synced = false;
     room.stateRequestAttempts = 0;

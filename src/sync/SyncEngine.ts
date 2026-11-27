@@ -13,6 +13,7 @@ import { staleBaseItem, type DecodedFileListItem, type RemoteApiClient } from ".
 import type { LocalIndex, LocalIndexRecord } from "./LocalIndex.js";
 import type { FileSystemAdapter } from "./FileSystemAdapter.js";
 import type { TransferTracker } from "../ui/TransferTracker.js";
+import type { CollabAuthors } from "../collab/CollabManager.js";
 import type { LogReason, SyncLog } from "./SyncLog.js";
 import { errorArgs } from "./errorArgs.js";
 import { t } from "../i18n/index.js";
@@ -77,6 +78,10 @@ export interface SyncEngineDeps {
    * the note is not live here, or this device is its host. Optional so the engine works without collab.
    */
   isCollabWriter?: (fileId: string) => boolean;
+  /** Who else's live edits are in the next write of `fileId` (see `CollabManager.authorsFor`); null when nobody's. */
+  collabAuthors?: (fileId: string) => CollabAuthors | null;
+  /** The write that carried `sent` went through. */
+  collabAuthorsSent?: (fileId: string, sent: CollabAuthors) => void;
   /**
    * Saves what is typed in an open editor of `path` to the file right now (Obsidian saves a moment after typing).
    * True when the note was open. Used before a download replaces the file, so nothing typed just then is lost.
@@ -171,11 +176,18 @@ export class SyncEngine {
   /** "Still editing this file" session ids (by fileId), folding a burst of saves into one history entry. */
   private readonly editSessions = new Map<string, { id: string; at: number }>();
   private syncing = false;
+  /** The full sync or poll in flight, so a caller can wait for it instead of being turned away. */
+  private running: Promise<unknown> | null = null;
   private currentGlobalVersion: number;
 
   /** Read by the status bar UI - true while a full sync or incremental poll is in flight. */
   get isSyncing(): boolean {
     return this.syncing;
+  }
+
+  /** Resolves once no full sync or poll is running (whether it worked or not). */
+  async whenIdle(): Promise<void> {
+    while (this.running) await this.running.catch(() => undefined);
   }
 
   constructor(private readonly deps: SyncEngineDeps) {
@@ -301,6 +313,29 @@ export class SyncEngine {
   async runFullSync(options: { thorough?: boolean } = {}): Promise<void> {
     if (this.deps.isPaused() || this.syncing) return;
     this.syncing = true;
+    const run = this.fullSyncRun(options);
+    this.running = run;
+    try {
+      await run;
+    } finally {
+      if (this.running === run) this.running = null;
+    }
+  }
+
+  /**
+   * A full sync that really runs: waits for one that is already going (the first sync after start, a poll) and then does
+   * its own. The sync button uses it, so its "finished" means this run is done, not that another one was in the way.
+   */
+  async runFullSyncNow(options: { thorough?: boolean } = {}): Promise<void> {
+    for (;;) {
+      await this.whenIdle();
+      if (this.deps.isPaused()) return;
+      if (!this.syncing) return this.runFullSync(options);
+      await new Promise((resolve) => window.setTimeout(resolve, 100)); // never spin, whatever holds the flag
+    }
+  }
+
+  private async fullSyncRun(options: { thorough?: boolean }): Promise<void> {
     const lastThorough = this.deps.thoroughCheck?.lastAt() ?? null;
     this.thoroughRun = options.thorough === true || !this.deps.thoroughCheck || lastThorough === null || Date.now() - lastThorough >= THOROUGH_EVERY_MS;
     // A full sync moves the cursor while it works. If it dies half way, the files it did not reach must be fetched
@@ -338,6 +373,16 @@ export class SyncEngine {
     if (this.deps.isPaused() || this.syncing) return;
     if (this.fullSyncRetryAt !== null && Date.now() >= this.fullSyncRetryAt) return this.runFullSync();
     this.syncing = true;
+    const run = this.pollRun();
+    this.running = run;
+    try {
+      await run;
+    } finally {
+      if (this.running === run) this.running = null;
+    }
+  }
+
+  private async pollRun(): Promise<void> {
     this.runFailures = 0;
     try {
       await this.doIncrementalPoll();
@@ -1770,6 +1815,7 @@ export class SyncEngine {
     let hash: Uint8Array | undefined;
     let uploadedPlaintext: Uint8Array | undefined;
     let stale: DecodedFileListItem | null = null;
+    let authors: CollabAuthors | null = null;
     // Size and time before the content was read (see `LocalIndexRecord.localStamp`).
     const statBefore = precomputed ? precomputed.stat : { size: file.stat.size, mtime: file.stat.mtime, at: Date.now() };
     try {
@@ -1783,6 +1829,7 @@ export class SyncEngine {
       const encryptedContent = await this.deps.crypto.encryptContent(plaintext);
       const encryptedPath = await this.deps.crypto.encryptPath(file.path);
 
+      authors = this.deps.collabAuthors?.(fileId) ?? null;
       result = await this.deps.remote.uploadFile(
         this.deps.vaultId,
         fileId,
@@ -1795,6 +1842,7 @@ export class SyncEngine {
           contentCiphertext: encryptedContent.ciphertext,
           editSessionId: this.touchEditSession(fileId),
           baseHash: base,
+          coEditors: authors ?? undefined,
         },
         (loaded, total) => this.deps.transfers?.progress(transferPath, loaded, total),
         // A large file goes up in chunks: deleting it meanwhile ends the upload instead of sending the rest.
@@ -1826,6 +1874,7 @@ export class SyncEngine {
     };
     await this.deps.localIndex.put(record);
     this.sentNotConfirmed.delete(fileId);
+    if (authors) this.deps.collabAuthorsSent?.(fileId, authors);
     this.noteOwnWrite(result.version);
     // Deleted here while it was on its way up (a small file is sent in one piece): the copy that just arrived at the server
     // goes again - the delete event found nothing to delete at the time and would otherwise never come back to it.
